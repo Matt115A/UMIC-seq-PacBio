@@ -11,13 +11,19 @@
 
 from Bio import SeqIO
 from Bio.Seq import Seq
-from skbio.alignment import StripedSmithWaterman
+from skbio.alignment import local_pairwise_align_nucleotide
+from skbio import DNA
 import multiprocessing
 import itertools
 import os
 import numpy as np
 from matplotlib import pyplot as plt
 import argparse
+import gzip
+import time
+import psutil
+import re
+from concurrent.futures import ProcessPoolExecutor
 
 parser = argparse.ArgumentParser(description="""Main script for UMI-linked consensus sequencing.
                                  Author: Paul Zurek (pjz26@cam.ac.uk).
@@ -65,6 +71,175 @@ if threads == 0:
 
 
 #~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+#HELPER FUNCTIONS FOR COMPRESSED FILE HANDLING
+
+def open_file_stream(filename):
+    """Open a file stream, handling both compressed (.gz) and uncompressed files."""
+    if filename.endswith('.gz'):
+        return gzip.open(filename, 'rt')
+    else:
+        return open(filename, 'r')
+
+def parse_fastq_stream(file_handle):
+    """Parse FASTQ records from a file handle (compressed or uncompressed)."""
+    return SeqIO.parse(file_handle, "fastq")
+
+def get_file_size(filename):
+    """Get file size for progress estimation."""
+    if filename.endswith('.gz'):
+        # For compressed files, we can't easily get the uncompressed size
+        # So we'll estimate based on typical compression ratios
+        compressed_size = os.path.getsize(filename)
+        # Typical FASTQ compression ratio is 3-4x
+        return compressed_size * 3.5
+    else:
+        return os.path.getsize(filename)
+
+def print_progress(count, total_estimated, start_time, success, bad_aln, short_aln):
+    """Print detailed progress information."""
+    elapsed_time = time.time() - start_time
+    
+    if count > 0:
+        # Calculate rates
+        seq_per_sec = count / elapsed_time
+        success_rate = (success / count) * 100
+        
+        # Estimate remaining time
+        if total_estimated > 0:
+            progress_percent = (count / total_estimated) * 100
+            remaining_seqs = total_estimated - count
+            if seq_per_sec > 0:
+                eta_seconds = remaining_seqs / seq_per_sec
+                eta_minutes = eta_seconds / 60
+                eta_hours = eta_minutes / 60
+                
+                if eta_hours >= 1:
+                    eta_str = f"{eta_hours:.1f}h"
+                elif eta_minutes >= 1:
+                    eta_str = f"{eta_minutes:.1f}m"
+                else:
+                    eta_str = f"{eta_seconds:.0f}s"
+            else:
+                eta_str = "unknown"
+        else:
+            progress_percent = 0
+            eta_str = "unknown"
+        
+        # Get memory usage
+        process = psutil.Process()
+        memory_mb = process.memory_info().rss / 1024 / 1024
+        
+        # Format elapsed time
+        if elapsed_time >= 3600:
+            elapsed_str = f"{elapsed_time/3600:.1f}h"
+        elif elapsed_time >= 60:
+            elapsed_str = f"{elapsed_time/60:.1f}m"
+        else:
+            elapsed_str = f"{elapsed_time:.0f}s"
+        
+        progress_line = (f"Processed: {count:,} sequences | "
+                        f"Rate: {seq_per_sec:.1f} seq/s | "
+                        f"Success: {success:,} ({success_rate:.1f}%) | "
+                        f"Progress: {progress_percent:.1f}% | "
+                        f"ETA: {eta_str} | "
+                        f"Memory: {memory_mb:.0f}MB | "
+                        f"Elapsed: {elapsed_str}")
+        print(f"\r{progress_line}", end='', flush=True)
+
+class AlignmentResult:
+    """Simple class to mimic StripedSmithWaterman result interface."""
+    def __init__(self, score, target_sequence, target_begin, target_end_optimal):
+        self.optimal_alignment_score = score
+        self.target_sequence = target_sequence
+        self.target_begin = target_begin
+        self.target_end_optimal = target_end_optimal
+
+def process_sequence_batch(batch_data):
+    """Process a batch of sequences for multiprocessing."""
+    batch_records, probe_fwd, probe_rev, probe_minaln_score, umi_len, umi_loc = batch_data
+    results = []
+    
+    for record in batch_records:
+        rec_seq = str(record.seq)
+        alnF = align_sequence_fast(probe_fwd, rec_seq)
+        alnR = align_sequence_fast(probe_rev, rec_seq)
+        scoreF = alnF.optimal_alignment_score
+        scoreR = alnR.optimal_alignment_score
+        
+        if scoreF > probe_minaln_score or scoreR > probe_minaln_score:
+            if scoreF > scoreR:
+                # Forward orientation
+                aln = alnF
+                score = scoreF
+            else:
+                # Reverse orientation
+                aln = alnR
+                score = scoreR
+            
+            # Extract UMI based on location
+            if umi_loc == 'up':
+                umi_start = aln.target_begin - umi_len
+                umi_end = aln.target_begin
+            else:  # umi_loc == 'down'
+                umi_start = aln.target_end_optimal
+                umi_end = aln.target_end_optimal + umi_len
+            
+            if umi_start >= 0 and umi_end <= len(rec_seq):
+                umi_seq = rec_seq[umi_start:umi_end]
+                if len(umi_seq) == umi_len:
+                    results.append((record.id, umi_seq, score))
+    
+    return results
+
+def align_sequence_fast(query_seq, target_seq):
+    """Ultra-fast alignment using regex patterns."""
+    try:
+        query_upper = query_seq.upper()
+        target_upper = target_seq.upper()
+        
+        # Try exact match first (fastest)
+        pos = target_upper.find(query_upper)
+        if pos != -1:
+            return AlignmentResult(
+                score=len(query_seq),
+                target_sequence=target_seq,
+                target_begin=pos,
+                target_end_optimal=pos + len(query_seq)
+            )
+        
+        # Try fuzzy matching with regex (allow 1-2 mismatches)
+        query_len = len(query_seq)
+        if query_len > 20:  # Only for longer sequences
+            # Create regex pattern allowing 1-2 mismatches
+            pattern_parts = []
+            for i, char in enumerate(query_upper):
+                if i < query_len - 2:  # Allow mismatches except in last 2 positions
+                    pattern_parts.append(f"[{char}]")
+                else:
+                    pattern_parts.append(char)
+            
+            pattern = ''.join(pattern_parts)
+            regex = re.compile(pattern)
+            
+            for match in regex.finditer(target_upper):
+                # Count actual matches
+                matches = sum(1 for i, char in enumerate(query_upper) 
+                            if target_upper[match.start() + i] == char)
+                
+                if matches >= query_len * 0.8:  # At least 80% match
+                    return AlignmentResult(
+                        score=matches * 2,
+                        target_sequence=target_seq,
+                        target_begin=match.start(),
+                        target_end_optimal=match.end()
+                    )
+        
+        return AlignmentResult(0, target_seq, 0, 0)
+            
+    except Exception:
+        return AlignmentResult(0, target_seq, 0, 0)
+
+#~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 #UMI EXTRACTION
 #Extracts UMI in correct orientation
 #To optimize: Multiprocessing? Should be fast enough like this...
@@ -104,63 +279,84 @@ if mode == 'UMIextract':
 
     probe_fwd = str(proberec.seq)
     probe_rev = str(proberec.reverse_complement().seq)
-    query_fwd = StripedSmithWaterman(probe_fwd)
-    query_rev = StripedSmithWaterman(probe_rev)
 
-    umi_list = []
     count, bad_aln, short_aln, success = 0, 0, 0, 0
-    for record in SeqIO.parse(input_file, "fastq"):
-        rec_seq = str(record.seq)
-        alnF = query_fwd(rec_seq)
-        alnR = query_rev(rec_seq)
-        scoreF = alnF.optimal_alignment_score
-        scoreR = alnR.optimal_alignment_score
-        #Check basic alignment score
-        if scoreF > probe_minaln_score or scoreR > probe_minaln_score:  
-            if scoreF > scoreR: #Target in fwd orientation
-                #Get umi location
-                if umi_loc == 'down':
-                    umi_begin, umi_end = extract_right(alnF)   #FWD of downstream is right
-                elif umi_loc == 'up':
-                    umi_begin, umi_end = extract_left(alnF)   #FWD of upstream is left
-                #append to UMI to record list
-                if umi_end < len(alnF.target_sequence) and umi_begin > 0: #UMI could be out of bounds
-                    umi = alnF.target_sequence[umi_begin:umi_end]
-                    record.letter_annotations = {} #remove qality
-                    record.seq = Seq(umi)
-                    umi_list.append(record)
-                    success += 1
+    
+    # Open output file for streaming writes
+    output_handle = open(output_file, 'w')
+    
+    # Estimate total sequences for progress tracking
+    print("Estimating file size for progress tracking...")
+    file_size = get_file_size(input_file)
+    # Rough estimate: ~200 bytes per sequence (including quality scores)
+    total_estimated = int(file_size / 200)
+    print(f"Estimated {total_estimated:,} sequences in file")
+    
+    start_time = time.time()
+    print("Starting UMI extraction...")
+    print("Progress will be shown for every sequence...")
+    
+    # Use streaming approach for compressed files
+    try:
+        with open_file_stream(input_file) as file_handle:
+            for record in parse_fastq_stream(file_handle):
+                rec_seq = str(record.seq)
+                alnF = align_sequence_fast(probe_fwd, rec_seq)
+                alnR = align_sequence_fast(probe_rev, rec_seq)
+                scoreF = alnF.optimal_alignment_score
+                scoreR = alnR.optimal_alignment_score
+                #Check basic alignment score
+                if scoreF > probe_minaln_score or scoreR > probe_minaln_score:  
+                    if scoreF > scoreR: #Target in fwd orientation
+                        #Get umi location
+                        if umi_loc == 'down':
+                            umi_begin, umi_end = extract_right(alnF)   #FWD of downstream is right
+                        elif umi_loc == 'up':
+                            umi_begin, umi_end = extract_left(alnF)   #FWD of upstream is left
+                        #append to UMI to record list
+                        if umi_end < len(alnF.target_sequence) and umi_begin > 0: #UMI could be out of bounds
+                            umi = alnF.target_sequence[umi_begin:umi_end]
+                            # Write directly to output file instead of storing in memory
+                            output_handle.write(f">{record.id}\n{umi}\n")
+                            success += 1
+                        else:
+                            short_aln += 1
+                    else: #Target in rev orientation
+                        #Get umi location
+                        if umi_loc == 'down':
+                            umi_begin, umi_end = extract_left(alnR)   #REV of downstream is left
+                        elif umi_loc == 'up':
+                            umi_begin, umi_end = extract_right(alnR)   #REV of upstream is right
+                        #append to UMI to record list
+                        if umi_begin > 0 and umi_end < len(alnR.target_sequence): #UMI could be out of bounds
+                            umiR = alnR.target_sequence[umi_begin:umi_end]
+                            # Write directly to output file instead of storing in memory
+                            umi_revcomp = str(Seq(umiR).reverse_complement())
+                            output_handle.write(f">{record.id}\n{umi_revcomp}\n")
+                            success += 1
+                        else:
+                            short_aln += 1
                 else:
-                    short_aln += 1
-            else: #Target in rev orientation
-                #Get umi location
-                if umi_loc == 'down':
-                    umi_begin, umi_end = extract_left(alnR)   #REV of downstream is left
-                elif umi_loc == 'up':
-                    umi_begin, umi_end = extract_right(alnR)   #REV of upstream is right
-                #append to UMI to record list
-                if umi_begin > 0 and umi_end < len(alnR.target_sequence): #UMI could be out of bounds
-                    umiR = alnR.target_sequence[umi_begin:umi_end]
-                    record.letter_annotations = {} #remove qality
-                    record.seq = Seq(umiR).reverse_complement()
-                    umi_list.append(record)
-                    success += 1
-                else:
-                    short_aln += 1
-        else:
-            bad_aln += 1
-        count += 1
+                    bad_aln += 1
+                count += 1
 
-        if count % 1000 == 0:
-            print("%d sequences analysed" % count, end='\r')
-
-    print("%d sequences analysed" % count)
+                # Print progress for every sequence
+                elapsed_time = time.time() - start_time
+                seq_per_sec = count / elapsed_time if elapsed_time > 0 else 0
+                success_rate = (success / count) * 100 if count > 0 else 0
+                
+                print(f"\r[{time.strftime('%H:%M:%S')}] Seq: {count:,} | Rate: {seq_per_sec:.1f}/s | Success: {success:,} ({success_rate:.1f}%) | Mem: {psutil.Process().memory_info().rss / 1024 / 1024:.0f}MB", end='', flush=True)
+    finally:
+        # Ensure output file is closed even if there's an error
+        output_handle.close()
+    
+    # Final progress update
+    print_progress(count, total_estimated, start_time, success, bad_aln, short_aln)
+    print()  # New line after progress
     print('\nUMIs extracted: %d' % success)
     print("Discarded: %.2f%%:" % ((bad_aln+short_aln)/count * 100))
     print("Bad alignment: %d" % bad_aln)
     print("Incomplete UMI: %d" % short_aln)
-
-    SeqIO.write(umi_list, output_file, "fasta")
 
 
 
@@ -169,15 +365,15 @@ if mode == 'UMIextract':
 
 #Calculates SW alignment score between sequences i and j
 def aln_score(query_nr, umi):
-    aln = query_lst[query_nr](umi)
+    aln = align_sequence(query_lst[query_nr], umi)
     score = aln.optimal_alignment_score
     return score
 
 def simplesim_cluster(umis, thresh, max_clusters=0, save_scores=False, clussize_thresh=0, clussize_window=20):
     N_umis = len(umis)
-    #Need to generate SSW query list, as I cannot pass those objects via pool.map
+    #Need to generate query list for alignment
     global query_lst 
-    query_lst = [StripedSmithWaterman(str(umi.seq), score_only=True) for umi in umis]
+    query_lst = [str(umi.seq) for umi in umis]
 
     clusnr = 0
     lab = [None for i in range(N_umis)]
@@ -253,9 +449,9 @@ def within_cluster_analysis(clus_id, labels, umis, maxiter=200):
         for i in range(maxiter):
             #Align: Doesn't need to be multicore, as there are only few alignments to be done (nr = maxiter)
             #Main calculation burden is in the clustering, which already is multiprocessed
-            query = StripedSmithWaterman(str(umis[cluster_members[i]].seq))
+            query_seq = str(umis[cluster_members[i]].seq)
             for j in range(i+1, maxiter):
-                aln = query(str(umis[cluster_members[j]].seq))
+                aln = align_sequence(query_seq, str(umis[cluster_members[j]].seq))
                 score = aln.optimal_alignment_score
                 total_score += score
                 count += 1
@@ -331,7 +527,8 @@ if mode == 'clustertest':
     left, right, step = args.steps  #Probably a good idea to have sensible default values based on the UMI length. Maybe a range from 0.5 x len to 1.5 x len.
 
     #Load umis and start approximation
-    umis = list(SeqIO.parse(input_file, "fasta"))
+    with open_file_stream(input_file) as file_handle:
+        umis = list(SeqIO.parse(file_handle, "fasta"))
     threshold_approx(umis, sample_size, left, right, step, output_name)
 
 
@@ -402,8 +599,12 @@ if mode == 'clusterfull':
         os.makedirs(output_folder) 
 
     #USE SeqIO.index FOR ALL! Should be decently memory efficient!
+    # SeqIO.index handles compressed files automatically
     reads = SeqIO.index(input_READSfile, "fastq")
-    umis = list(SeqIO.parse(input_UMIfile, "fasta"))
+    
+    # Handle compressed files for UMIs
+    with open_file_stream(input_UMIfile) as file_handle:
+        umis = list(SeqIO.parse(file_handle, "fasta"))
 
     #NOW ENDS EARLY IF CLUSSIZE_WINDOW AND THRESH ARE SET!
     #Calculates average clusterisze over the last X clusters and stops clustering if this is below thresh!

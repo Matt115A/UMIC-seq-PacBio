@@ -1,0 +1,19 @@
+GH11_epPCR/
+
+# Temporary files
+*.log
+*.pdf
+__pycache__/
+*.pyc
+.DS_Store
+
+# Test files
+test_*
+*_test*
+*_temp*
+
+# Output directories
+UMIclusterfull_*
+consensus_results/
+variant_results/
+
