@@ -17,6 +17,7 @@ import shutil
 
 def run_abpoa_consensus(cluster_file, output_dir, max_reads=20):
     """Run abpoa to generate consensus sequence from first N reads."""
+    temp_file = None
     try:
         cluster_name = Path(cluster_file).stem
         consensus_file = os.path.join(output_dir, f"{cluster_name}_consensus.fasta")
@@ -28,15 +29,18 @@ def run_abpoa_consensus(cluster_file, output_dir, max_reads=20):
         # Create temporary file with first N sequences
         temp_file = os.path.join(output_dir, f"{cluster_name}_temp_{max_reads}.fasta")
         
-        # Extract first N sequences
+        # Extract first N sequences (fixed to include full sequences)
         with open(cluster_file, 'r') as infile, open(temp_file, 'w') as outfile:
             count = 0
+            in_sequence = False
             for line in infile:
                 if line.startswith('>'):
                     if count >= max_reads:
                         break
                     count += 1
-                outfile.write(line)
+                    in_sequence = True
+                if in_sequence:
+                    outfile.write(line)
         
         # Run abpoa consensus
         cmd = [
@@ -47,18 +51,24 @@ def run_abpoa_consensus(cluster_file, output_dir, max_reads=20):
             temp_file
         ]
         
-        result = subprocess.run(cmd, capture_output=True, text=True)
-        
-        # Clean up temp file
-        os.remove(temp_file)
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
         
         if result.returncode != 0:
             return f"abpoa failed for {cluster_name}: {result.stderr}"
         
         return consensus_file
         
+    except subprocess.TimeoutExpired:
+        return f"abpoa timeout for {cluster_name}"
     except Exception as e:
         return f"Error in abpoa for {cluster_name}: {str(e)}"
+    finally:
+        # Always clean up temp file
+        if temp_file and os.path.exists(temp_file):
+            try:
+                os.remove(temp_file)
+            except:
+                pass
 
 def process_cluster_simple(cluster_file, output_dir, max_reads=20):
     """Process a single cluster to generate consensus sequence."""

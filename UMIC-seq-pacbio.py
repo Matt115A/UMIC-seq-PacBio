@@ -66,125 +66,283 @@ def run_umi_extraction(args):
 
 def run_clustering(args):
     """Run clustering step."""
-    cmd = [
-        "python", "UMIC-seq.py", "clusterfull",
-        "-i", args.input_umi,
-        "-o", args.output_dir,
-        "--reads", args.input_reads,
-        "--aln_thresh", str(int(args.aln_thresh * 100)),  # Convert to integer percentage
-        "--size_thresh", str(args.size_thresh)
-    ]
+    # Determine which clustering method to use
+    use_fast = args.fast and not args.slow
     
-    return run_command(cmd, "UMI Clustering")
+    if use_fast:
+        # Use fast CD-HIT clustering
+        cmd = [
+            "python", "UMIC-seq.py", "clusterfull_fast",
+            "-i", args.input_umi,
+            "-o", args.output_dir,
+            "--reads", args.input_reads,
+            "--identity", str(args.identity),
+            "--size_thresh", str(args.size_thresh)
+        ]
+        description = "Fast UMI Clustering (CD-HIT)"
+    else:
+        # Use slow alignment-based clustering
+        cmd = [
+            "python", "UMIC-seq.py", "clusterfull",
+            "-i", args.input_umi,
+            "-o", args.output_dir,
+            "--reads", args.input_reads,
+            "--aln_thresh", str(int(args.aln_thresh * 100)),  # Convert to integer percentage
+            "--size_thresh", str(args.size_thresh)
+        ]
+        description = "Slow UMI Clustering (alignment-based)"
+    
+    return run_command(cmd, description)
 
 def run_consensus_generation(args):
     """Run consensus generation step."""
-    # Create a temporary script with the correct paths
-    script_content = f'''#!/usr/bin/env python3
-import os
-import sys
-sys.path.append('.')
-
-# Override the configuration in simple_consensus_pipeline.py
-import simple_consensus_pipeline
-
-# Update the configuration
-simple_consensus_pipeline.main = lambda: None
-
-# Set the configuration
-cluster_files_dir = '{args.input_dir}'
-output_dir = '{args.output_dir}'
-max_reads = {args.max_reads}
-max_workers = {args.max_workers}
-
-# Run the consensus pipeline
-from simple_consensus_pipeline import run_abpoa_consensus, main as original_main
-import tempfile
-import shutil
-from concurrent.futures import ThreadPoolExecutor
-import time
-import threading
-
-def main():
-    print(f"Starting simple consensus pipeline...")
-    print(f"Cluster files directory: {{cluster_files_dir}}")
-    print(f"Output directory: {{output_dir}}")
+    # Import the consensus functions directly
+    import simple_consensus_pipeline
     
+    cluster_files_dir = args.input_dir
+    output_dir = args.output_dir
+    max_reads = args.max_reads
+    max_workers = args.max_workers
+    
+    print(f"Starting simple consensus pipeline...")
+    print(f"Cluster files directory: {cluster_files_dir}")
+    print(f"Output directory: {output_dir}")
+    print(f"Max reads per consensus: {max_reads}")
+    print(f"Max workers: {max_workers}")
+    
+    # Ensure output directory exists
     os.makedirs(output_dir, exist_ok=True)
     
-    with open('clusterfiles.txt', 'w') as f:
-        for cluster_file in os.listdir(cluster_files_dir):
-            if cluster_file.endswith('.fasta'):
-                f.write(os.path.join(cluster_files_dir, cluster_file) + '\\n')
+    # Get list of cluster files
+    cluster_files = []
+    for file in os.listdir(cluster_files_dir):
+        if file.endswith('.fasta') and file.startswith('cluster_'):
+            cluster_files.append(os.path.join(cluster_files_dir, file))
     
-    # Run the original main function
-    original_main()
-
-if __name__ == "__main__":
-    main()
-'''
+    total_clusters = len(cluster_files)
+    print(f"Found {total_clusters:,} cluster files to process")
     
-    with open('temp_consensus_script.py', 'w') as f:
-        f.write(script_content)
+    if total_clusters == 0:
+        print("❌ No cluster files found!")
+        return False
     
-    cmd = ["python", "temp_consensus_script.py"]
-    success = run_command(cmd, "Consensus Generation")
+    # Track progress
+    success_count = 0
+    failed_count = 0
+    start_time = time.time()
     
-    # Clean up
-    if os.path.exists('temp_consensus_script.py'):
-        os.remove('temp_consensus_script.py')
-    if os.path.exists('clusterfiles.txt'):
-        os.remove('clusterfiles.txt')
+    import threading
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+    import gc
     
-    return success
+    # Thread-safe progress tracking
+    progress_lock = threading.Lock()
+    
+    def update_progress():
+        nonlocal success_count, failed_count
+        with progress_lock:
+            processed = success_count + failed_count
+            elapsed_time = time.time() - start_time
+            rate = processed / elapsed_time if elapsed_time > 0 else 0
+            
+            # Calculate ETA
+            if rate > 0:
+                remaining = total_clusters - processed
+                eta_seconds = remaining / rate
+                eta_minutes = eta_seconds / 60
+                
+                if eta_minutes >= 1:
+                    eta_str = f"{eta_minutes:.1f}m"
+                else:
+                    eta_str = f"{eta_seconds:.0f}s"
+            else:
+                eta_str = "unknown"
+            
+            # Progress percentage
+            progress_percent = (processed / total_clusters) * 100
+            
+            # Print progress
+            progress_line = (f"\rProgress: {progress_percent:.1f}% "
+                           f"({processed:,}/{total_clusters:,}) | "
+                           f"Success: {success_count:,} | Failed: {failed_count:,} | "
+                           f"Rate: {rate:.1f} clusters/s | ETA: {eta_str}")
+            
+            print(progress_line, end='', flush=True)
+            
+            # Periodic garbage collection every 5000 clusters
+            if processed > 0 and processed % 5000 == 0:
+                gc.collect()
+                print(f"\n[GC at {processed:,} clusters]", flush=True)
+    
+    # Process clusters in parallel with batched submission
+    BATCH_SIZE = 1000  # Submit 1000 at a time to avoid memory buildup
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        for batch_start in range(0, total_clusters, BATCH_SIZE):
+            batch_end = min(batch_start + BATCH_SIZE, total_clusters)
+            batch_files = cluster_files[batch_start:batch_end]
+            
+            # Submit batch
+            futures = {executor.submit(simple_consensus_pipeline.process_cluster_simple, cf, output_dir, max_reads): cf 
+                      for cf in batch_files}
+            
+            # Process as they complete
+            for future in as_completed(futures):
+                result = future.result()
+                
+                with progress_lock:
+                    if "SUCCESS" in result:
+                        success_count += 1
+                    else:
+                        failed_count += 1
+                        if failed_count <= 10:  # Only show first 10 failures
+                            print(f"\nFailed: {result}")
+                
+                update_progress()
+    
+    # Final summary
+    total_time = time.time() - start_time
+    print(f"\n\nConsensus generation completed!")
+    print(f"Total clusters processed: {total_clusters:,}")
+    print(f"Successful: {success_count:,}")
+    print(f"Failed: {failed_count:,}")
+    print(f"Total time: {total_time/60:.1f} minutes")
+    print(f"Output directory: {output_dir}")
+    
+    return success_count > 0
 
 def run_variant_calling(args):
     """Run variant calling step."""
-    # Create a temporary script with the correct paths
-    script_content = f'''#!/usr/bin/env python3
-import os
-import sys
-sys.path.append('.')
-
-# Override the configuration in sensitive_variant_pipeline.py
-import sensitive_variant_pipeline
-
-# Update the configuration
-consensus_dir = '{args.input_dir}'
-reference_file = '{args.reference}'
-output_dir = '{args.output_dir}'
-combined_vcf = '{args.combined_vcf}'
-max_workers = {args.max_workers}
-
-# Run the variant calling pipeline
-from sensitive_variant_pipeline import main as original_main
-
-def main():
+    import sensitive_variant_pipeline
+    import threading
+    import time
+    from pathlib import Path
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+    
+    consensus_dir = args.input_dir
+    reference_file = args.reference
+    output_dir = args.output_dir
+    combined_vcf = args.combined_vcf
+    max_workers = args.max_workers
+    
+    print(f"\n{'='*60}")
+    print(f"RUNNING: Variant Calling")
+    print(f"{'='*60}")
+    
+    start_time = time.time()
+    
     print(f"Starting SENSITIVE variant calling pipeline...")
     print(f"This will call ALL variants, including single mismatches!")
-    print(f"Consensus directory: {{consensus_dir}}")
-    print(f"Reference file: {{reference_file}}")
-    print(f"Output directory: {{output_dir}}")
-    print(f"Combined VCF: {{combined_vcf}}")
+    print(f"Consensus directory: {consensus_dir}")
+    print(f"Reference file: {reference_file}")
+    print(f"Output directory: {output_dir}")
+    print(f"Combined VCF: {combined_vcf}")
     
-    # Run the original main function
-    original_main()
-
-if __name__ == "__main__":
-    main()
-'''
+    # Ensure output directory exists
+    os.makedirs(output_dir, exist_ok=True)
     
-    with open('temp_variant_script.py', 'w') as f:
-        f.write(script_content)
+    # Get list of consensus files
+    consensus_files = []
+    for file in os.listdir(consensus_dir):
+        if file.endswith('_consensus.fasta'):
+            consensus_files.append(os.path.join(consensus_dir, file))
     
-    cmd = ["python", "temp_variant_script.py"]
-    success = run_command(cmd, "Variant Calling")
+    total_consensus = len(consensus_files)
+    print(f"Found {total_consensus:,} consensus files to process\n")
     
-    # Clean up
-    if os.path.exists('temp_variant_script.py'):
-        os.remove('temp_variant_script.py')
+    # Track progress
+    success_count = 0
+    failed_count = 0
     
-    return success
+    # Thread-safe progress tracking
+    progress_lock = threading.Lock()
+    
+    def update_progress():
+        nonlocal success_count, failed_count
+        with progress_lock:
+            processed = success_count + failed_count
+            elapsed_time = time.time() - start_time
+            rate = processed / elapsed_time if elapsed_time > 0 else 0
+            
+            # Calculate ETA
+            if rate > 0:
+                remaining = total_consensus - processed
+                eta_seconds = remaining / rate
+                eta_minutes = eta_seconds / 60
+                eta_hours = eta_minutes / 60
+                
+                if eta_hours >= 1:
+                    eta_str = f"{eta_hours:.1f}h"
+                elif eta_minutes >= 1:
+                    eta_str = f"{eta_minutes:.1f}m"
+                else:
+                    eta_str = f"{eta_seconds:.0f}s"
+            else:
+                eta_str = "unknown"
+            
+            # Format elapsed time
+            if elapsed_time >= 3600:
+                elapsed_str = f"{elapsed_time/3600:.1f}h"
+            elif elapsed_time >= 60:
+                elapsed_str = f"{elapsed_time/60:.1f}m"
+            else:
+                elapsed_str = f"{elapsed_time:.0f}s"
+            
+            # Progress bar
+            progress_percent = (processed / total_consensus) * 100
+            bar_length = 50
+            filled_length = int(bar_length * processed // total_consensus)
+            bar = '█' * filled_length + '-' * (bar_length - filled_length)
+            
+            # Print progress line
+            progress_line = (f"\rProgress: |{bar}| {progress_percent:.1f}% "
+                           f"({processed:,}/{total_consensus:,}) | "
+                           f"Success: {success_count:,} | Failed: {failed_count:,} | "
+                           f"Rate: {rate:.1f} consensus/s | ETA: {eta_str} | "
+                           f"Elapsed: {elapsed_str}")
+            
+            print(progress_line, end='', flush=True)
+    
+    # Process consensus files in parallel with batched submission
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = {executor.submit(sensitive_variant_pipeline.process_consensus_file_sensitive, 
+                                  cf, reference_file, output_dir): cf 
+                  for cf in consensus_files}
+        
+        # Process as they complete
+        for future in as_completed(futures):
+            result = future.result()
+            
+            with progress_lock:
+                if "SUCCESS" in result:
+                    success_count += 1
+                else:
+                    failed_count += 1
+                    if failed_count <= 10:  # Only show first 10 failures
+                        print(f"\nFailed: {result}")
+            
+            update_progress()
+    
+    # Combine VCF files
+    print(f"\n\nCombining VCF files...")
+    combine_success = sensitive_variant_pipeline.combine_vcf_files(output_dir, combined_vcf)
+    
+    # Final summary
+    total_time = time.time() - start_time
+    print(f"\nSensitive variant calling pipeline completed!")
+    print(f"Total consensus processed: {total_consensus:,}")
+    print(f"Successful: {success_count:,}")
+    print(f"Failed: {failed_count:,}")
+    print(f"Total time: {total_time/60:.1f} minutes")
+    print(f"Average rate: {total_consensus/total_time:.1f} consensus/second")
+    print(f"Individual VCF files: {output_dir}")
+    if combine_success:
+        print(f"Combined VCF: {combined_vcf}")
+    else:
+        print("Failed to create combined VCF")
+    
+    print(f"\n✓ COMPLETED: Variant Calling ({total_time:.1f}s)")
+    
+    return success_count > 0
 
 def run_analysis(args):
     """Run detailed analysis step."""
@@ -235,8 +393,11 @@ def run_full_pipeline(args):
         input_umi=umi_file,
         input_reads=args.input,
         aln_thresh=args.aln_thresh,
+        identity=getattr(args, 'identity', 0.90),
         size_thresh=args.size_thresh,
-        output_dir=cluster_dir
+        output_dir=cluster_dir,
+        fast=getattr(args, 'fast', True),
+        slow=getattr(args, 'slow', False)
     )
     
     if not run_clustering(cluster_args):
@@ -322,10 +483,15 @@ Examples:
     all_parser.add_argument('--reference', required=True, help='Reference FASTA file')
     all_parser.add_argument('--output_dir', required=True, help='Output directory')
     all_parser.add_argument('--umi_len', type=int, default=52, help='UMI length (default: 52)')
-    all_parser.add_argument('--aln_thresh', type=float, default=0.47, help='Alignment threshold (default: 0.47)')
+    all_parser.add_argument('--aln_thresh', type=float, default=0.47, help='Alignment threshold for slow clustering (default: 0.47)')
+    all_parser.add_argument('--identity', type=float, default=0.90, help='Sequence identity for fast clustering (default: 0.90)')
     all_parser.add_argument('--size_thresh', type=int, default=10, help='Size threshold (default: 10)')
     all_parser.add_argument('--max_reads', type=int, default=20, help='Max reads per consensus (default: 20)')
     all_parser.add_argument('--max_workers', type=int, default=4, help='Max parallel workers (default: 4)')
+    all_parser.add_argument('--fast', action='store_true', default=True, help='Use fast CD-HIT clustering (default: True)')
+    all_parser.add_argument('--slow', action='store_true', help='Use slow alignment-based clustering')
+    all_parser.add_argument('--umi_loc', type=str, default='up', choices=['up', 'down'], help='UMI location relative to probe (up or down, default: up)')
+    all_parser.add_argument('--min_probe_score', type=int, default=15, help='Minimal alignment score of probe for processing (default: 15)')
     
     # Individual step commands
     extract_parser = subparsers.add_parser('extract', help='Extract UMIs from raw reads')
@@ -337,9 +503,12 @@ Examples:
     cluster_parser = subparsers.add_parser('cluster', help='Cluster UMIs')
     cluster_parser.add_argument('--input_umi', required=True, help='Input UMI FASTA file')
     cluster_parser.add_argument('--input_reads', required=True, help='Input reads FASTQ file (can be .gz)')
-    cluster_parser.add_argument('--aln_thresh', type=float, default=0.47, help='Alignment threshold (default: 0.47)')
+    cluster_parser.add_argument('--aln_thresh', type=float, default=0.47, help='Alignment threshold for slow method (default: 0.47)')
+    cluster_parser.add_argument('--identity', type=float, default=0.90, help='Sequence identity for fast method (default: 0.90)')
     cluster_parser.add_argument('--size_thresh', type=int, default=10, help='Size threshold (default: 10)')
     cluster_parser.add_argument('--output_dir', required=True, help='Output directory for clusters')
+    cluster_parser.add_argument('--fast', action='store_true', default=True, help='Use fast CD-HIT clustering (default: True)')
+    cluster_parser.add_argument('--slow', action='store_true', help='Use slow alignment-based clustering')
     
     consensus_parser = subparsers.add_parser('consensus', help='Generate consensus sequences')
     consensus_parser.add_argument('--input_dir', required=True, help='Input cluster directory')

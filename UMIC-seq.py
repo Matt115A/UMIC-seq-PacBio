@@ -23,6 +23,7 @@ import gzip
 import time
 import psutil
 import re
+import subprocess
 from concurrent.futures import ProcessPoolExecutor
 
 parser = argparse.ArgumentParser(description="""Main script for UMI-linked consensus sequencing.
@@ -60,13 +61,26 @@ fullclus_parser.add_argument('--size_thresh', type=int, help='Minimal size a clu
 fullclus_parser.add_argument('--stop_thresh', type=int, default=5, required=False, help='Defaults to 5. Stops clustering if the average cluster size is smaller than this threshold. Essentially speeds up the clustering by dropping outliers. Set the threshold to 0 if you do not want the program to quit early!')
 fullclus_parser.add_argument('--stop_window', type=int, default=20, required=False, help='Defaults to 20. Sets the number of clusters to be used to calculate average cluster size.')
 
+#Arguments for clusterfull_fast (CD-HIT based)
+fastclus_parser = subparsers.add_parser('clusterfull_fast', help='Fast clustering of UMIs using CD-HIT (1000x faster than clusterfull).')
+fastclus_parser.add_argument('-i', '--input', help='Fasta file of extracted UMIs.', required=True)
+fastclus_parser.add_argument('-o', '--output', help='Folder name for output files.', required=True)
+fastclus_parser.add_argument('--reads', help='Fastq file of basecalled reads.', required=True)
+fastclus_parser.add_argument('--identity', type=float, default=0.90, help='Sequence identity threshold for clustering (0-1). Default: 0.90 (90%% identity)')
+fastclus_parser.add_argument('--size_thresh', type=int, help='Minimal size a cluster can have to be written to file.', required=True)
 
-#Parse arguments
-args = parser.parse_args()
-mode = args.mode
-threads = args.threads
-if threads == 0:
-    threads = multiprocessing.cpu_count()
+# Module-level variables that will be set when run as main
+args = None
+mode = None
+threads = 0
+
+#Parse arguments only when run as main script
+if __name__ == '__main__':
+    args = parser.parse_args()
+    mode = args.mode
+    threads = args.threads
+    if threads == 0:
+        threads = multiprocessing.cpu_count()
 
 
 
@@ -239,6 +253,23 @@ def align_sequence_fast(query_seq, target_seq):
     except Exception:
         return AlignmentResult(0, target_seq, 0, 0)
 
+def align_sequence(query_seq, target_seq):
+    """
+    Alignment function for clustering (uses skbio for accurate scoring).
+    This is used for UMI-to-UMI comparisons where accuracy is more important than speed.
+    """
+    alignment, score, _ = local_pairwise_align_nucleotide(
+        DNA(query_seq), 
+        DNA(target_seq)
+    )
+    # Return an AlignmentResult-like object for compatibility
+    return AlignmentResult(
+        score=score,
+        target_sequence=target_seq,
+        target_begin=0,
+        target_end_optimal=len(target_seq)
+    )
+
 #~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 #UMI EXTRACTION
 #Extracts UMI in correct orientation
@@ -264,7 +295,7 @@ def extract_right(aln):
     return umi_begin, umi_end
 
 
-if mode == 'UMIextract':
+if __name__ == '__main__' and mode == 'UMIextract':
     #Set up variables
     input_file = args.input
     probe_file = args.probe
@@ -364,15 +395,14 @@ if mode == 'UMIextract':
 #GENERAL CLLUSTERING FUNCTIONS
 
 #Calculates SW alignment score between sequences i and j
-def aln_score(query_nr, umi):
-    aln = align_sequence(query_lst[query_nr], umi)
+def aln_score(query_seq, umi):
+    aln = align_sequence(query_seq, umi)
     score = aln.optimal_alignment_score
     return score
 
 def simplesim_cluster(umis, thresh, max_clusters=0, save_scores=False, clussize_thresh=0, clussize_window=20):
     N_umis = len(umis)
-    #Need to generate query list for alignment
-    global query_lst 
+    #Generate query list for alignment
     query_lst = [str(umi.seq) for umi in umis]
 
     clusnr = 0
@@ -386,7 +416,9 @@ def simplesim_cluster(umis, thresh, max_clusters=0, save_scores=False, clussize_
     #Goes through seq_index and only compares those indices and removes from there!
     while len(seq_index) > 0:
         #Calculate a list of similar umis to the first one left in seq_index 
-        score_lst = pool.starmap(aln_score, zip(itertools.repeat(seq_index[0]), remaining_umis))
+        # Pass the actual query sequence instead of index
+        query_seq = query_lst[seq_index[0]]
+        score_lst = pool.starmap(aln_score, zip(itertools.repeat(query_seq), remaining_umis))
         if save_scores:
             score_lst_lst.append(score_lst)
 
@@ -487,7 +519,7 @@ def similarity_histogram(score_lst_lst, outname):
             axarr[a,b].hist(score_lst_lst[i], bins=np.arange(min(score_lst_lst[i]), max(score_lst_lst[i])+binwidth, binwidth))
             axarr[a,b].set_yscale('log')
             i += 1
-    plt.savefig(output_name + "_similarityscores_hist.pdf", bbox_inches='tight')
+    plt.savefig(outname + "_similarityscores_hist.pdf", bbox_inches='tight')
 
 
 #Function performing a threshold approximation for clustering
@@ -519,7 +551,7 @@ def threshold_approx(umis, ssize, left, right, step, outname):
     plt.savefig(outname + "_thresholdapproximation.pdf", bbox_inches='tight')
 
 
-if mode == 'clustertest':
+if __name__ == '__main__' and mode == 'clustertest':
     #Setup
     input_file = args.input
     sample_size = args.samplesize
@@ -537,7 +569,7 @@ if mode == 'clustertest':
 #FULL CLUSTERING
 
 ##Change max_clusters to eg 10 for testing, leave out/set to 0 for production
-def cluster_sequences(umis, reads, aln_thresh, size_thresh, max_clusters=0, clussize_thresh=0, clussize_window=20):
+def cluster_sequences(umis, reads_file_path, aln_thresh, size_thresh, max_clusters=0, clussize_thresh=0, clussize_window=20):
     print("Beginning clustering...")
     clus_N, cluster_sizes, labels = simplesim_cluster(umis, aln_thresh, max_clusters=max_clusters, clussize_thresh=clussize_thresh, clussize_window=clussize_window) 
 
@@ -548,7 +580,7 @@ def cluster_sequences(umis, reads, aln_thresh, size_thresh, max_clusters=0, clus
     large_clus = [1 for size in cluster_sizes if size >= size_thresh]
     print(f"Clusters with >= {size_thresh} members: {sum(large_clus)}")
     seq_large_clus = sum([size for size in cluster_sizes if size >= size_thresh])
-    rel_seq_large_clus = seq_large_clus / len(reads) * 100
+    rel_seq_large_clus = seq_large_clus / len(umis) * 100
     print(f"Total number of sequences in clusters with >= {size_thresh} members: {seq_large_clus} ({rel_seq_large_clus:.2f}%)")
 
     #Plot clustersizes histogram
@@ -575,16 +607,25 @@ def cluster_sequences(umis, reads, aln_thresh, size_thresh, max_clusters=0, clus
     count = 0
     for i in range(clus_N):
         if cluster_sizes[i] >= size_thresh:
-            #Get reads according to UMI label
+            #Get reads according to UMI label using streaming
             count += 1
             clus_member_ids = [rec.id for rec, lab in zip(umis, labels) if lab == i]
-            clus_members = [reads[seqid] for seqid in clus_member_ids]
-            fname = output_folder + "/cluster_" + str(count) + ".fasta" #FASTA OR FASTQ?
+            
+            # Stream through reads file to find matching sequences
+            clus_members = []
+            with open_file_stream(reads_file_path) as file_handle:
+                for record in parse_fastq_stream(file_handle):
+                    if record.id in clus_member_ids:
+                        clus_members.append(record)
+                        if len(clus_members) == len(clus_member_ids):
+                            break  # Found all members
+            
+            fname = output_folder + "/cluster_" + str(count) + ".fasta"
             SeqIO.write(clus_members, fname, "fasta")
     print("Cluster files written")
 
 
-if mode == 'clusterfull':
+if __name__ == '__main__' and mode == 'clusterfull':
     #Setup
     input_UMIfile = args.input   #'./2_UMIextract/UMIexRS_BC03.fasta'
     input_READSfile = args.reads  #'./1_demultiplex/UMIrandomsample_BC03.fastq'
@@ -598,9 +639,9 @@ if mode == 'clusterfull':
     if not os.path.exists(output_folder):
         os.makedirs(output_folder) 
 
-    #USE SeqIO.index FOR ALL! Should be decently memory efficient!
-    # SeqIO.index handles compressed files automatically
-    reads = SeqIO.index(input_READSfile, "fastq")
+    # Use streaming approach for compressed files
+    # SeqIO.index doesn't work with gzipped files, so we'll use streaming
+    print(f"Using streaming approach for reads file: {input_READSfile}")
     
     # Handle compressed files for UMIs
     with open_file_stream(input_UMIfile) as file_handle:
@@ -608,6 +649,206 @@ if mode == 'clusterfull':
 
     #NOW ENDS EARLY IF CLUSSIZE_WINDOW AND THRESH ARE SET!
     #Calculates average clusterisze over the last X clusters and stops clustering if this is below thresh!
-    cluster_sequences(umis, reads, aln_thresh, size_thresh, clussize_thresh=clussize_thresh, clussize_window=clussize_window)
+    cluster_sequences(umis, input_READSfile, aln_thresh, size_thresh, clussize_thresh=clussize_thresh, clussize_window=clussize_window)
+
+
+#~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+#FAST CLUSTERING USING CD-HIT
+
+def parse_cdhit_clusters(clstr_file):
+    """Parse CD-HIT .clstr file and return cluster assignments."""
+    clusters = {}  # cluster_id -> list of sequence IDs
+    current_cluster = -1
+    
+    with open(clstr_file, 'r') as f:
+        for line in f:
+            line = line.strip()
+            if line.startswith('>Cluster'):
+                current_cluster = int(line.split()[1])
+                clusters[current_cluster] = []
+            elif line:
+                # Parse sequence ID from line like: "0	52nt, >sequence_id... at 100%"
+                seq_id = line.split('>')[1].split('...')[0]
+                clusters[current_cluster].append(seq_id)
+    
+    return clusters
+
+def run_cdhit_clustering(input_umi_file, output_folder, identity_threshold, size_thresh, reads_file_path):
+    """Run CD-HIT clustering on UMI sequences."""
+    print(f"Running CD-HIT clustering with {identity_threshold:.2f} identity threshold...", flush=True)
+    
+    # Run CD-HIT
+    cdhit_output = os.path.join(output_folder, "cdhit_output")
+    cdhit_cmd = [
+        'cd-hit-est',
+        '-i', input_umi_file,
+        '-o', cdhit_output,
+        '-c', str(identity_threshold),
+        '-n', '8',  # word size for 90% identity
+        '-d', '0',  # full sequence ID in output
+        '-M', '0',  # unlimited memory
+        '-T', str(threads)
+    ]
+    
+    print(f"Running: {' '.join(cdhit_cmd)}")
+    result = subprocess.run(cdhit_cmd, capture_output=True, text=True)
+    
+    if result.returncode != 0:
+        print(f"CD-HIT failed: {result.stderr}")
+        return False
+    
+    print("CD-HIT clustering completed!")
+    
+    # Parse cluster file
+    clstr_file = cdhit_output + '.clstr'
+    clusters = parse_cdhit_clusters(clstr_file)
+    
+    print(f"Total clusters: {len(clusters)}")
+    
+    # Filter by size and write cluster files
+    cluster_sizes = [len(members) for members in clusters.values()]
+    large_clusters = {cid: members for cid, members in clusters.items() if len(members) >= size_thresh}
+    
+    print(f"Clusters with >= {size_thresh} members: {len(large_clusters)}")
+    
+    if len(large_clusters) == 0:
+        print("No clusters meet size threshold!")
+        return True
+    
+    # SINGLE-PASS extraction: Stream once, write to temp batch files, then split
+    print(f"Extracting cluster members via single-pass streaming...", flush=True)
+    print(f"Processing {len(large_clusters):,} clusters with {sum(len(m) for m in large_clusters.values()):,} total sequences", flush=True)
+    
+    # Build read-to-cluster mapping
+    print(f"Building read-to-cluster mapping...", flush=True)
+    read_to_cluster_file = {}
+    cluster_to_file = {}
+    
+    # Assign each cluster to a batch file (max 1000 clusters per batch file to manage memory)
+    BATCH_SIZE = 1000
+    cluster_list = list(large_clusters.items())
+    num_batch_files = (len(cluster_list) + BATCH_SIZE - 1) // BATCH_SIZE
+    
+    for idx, (cluster_id, member_ids) in enumerate(cluster_list):
+        batch_file_idx = idx // BATCH_SIZE
+        cluster_to_file[cluster_id] = batch_file_idx
+        for read_id in member_ids:
+            read_to_cluster_file[read_id] = (cluster_id, batch_file_idx)
+    
+    print(f"Will use {num_batch_files} temporary batch files", flush=True)
+    
+    # Create batch file handles
+    import tempfile
+    temp_dir = tempfile.mkdtemp(dir=output_folder)
+    batch_files = []
+    for i in range(num_batch_files):
+        fname = os.path.join(temp_dir, f"batch_{i}.txt")
+        batch_files.append(open(fname, 'w'))
+    
+    # SINGLE PASS: Stream through reads and write to batch files
+    print(f"Streaming through reads file (single pass)...", flush=True)
+    total_found = 0
+    total_needed = len(read_to_cluster_file)
+    
+    try:
+        with open_file_stream(reads_file_path) as file_handle:
+            for i, record in enumerate(parse_fastq_stream(file_handle)):
+                if record.id in read_to_cluster_file:
+                    cluster_id, batch_idx = read_to_cluster_file[record.id]
+                    # Write to batch file: cluster_id|seq_id|sequence
+                    batch_files[batch_idx].write(f"{cluster_id}|{record.id}|{str(record.seq)}\n")
+                    total_found += 1
+                    
+                    if total_found % 50000 == 0:
+                        print(f"Progress: {total_found:,}/{total_needed:,} sequences ({100*total_found/total_needed:.1f}%)", flush=True)
+                    
+                    if total_found == total_needed:
+                        break
+                
+                if (i + 1) % 2000000 == 0:
+                    print(f"Scanned {(i+1):,} reads, found {total_found:,}/{total_needed:,}", flush=True)
+    finally:
+        # Close batch files
+        for f in batch_files:
+            f.close()
+    
+    print(f"✓ Single pass complete: found {total_found:,}/{total_needed:,} sequences", flush=True)
+    
+    # Now split batch files into individual cluster files
+    print(f"Writing individual cluster files...", flush=True)
+    written = 0
+    
+    for batch_idx in range(num_batch_files):
+        batch_fname = os.path.join(temp_dir, f"batch_{batch_idx}.txt")
+        
+        # Read batch file and group by cluster
+        cluster_seqs = {}
+        with open(batch_fname, 'r') as f:
+            for line in f:
+                cluster_id, seq_id, sequence = line.strip().split('|', 2)
+                if cluster_id not in cluster_seqs:
+                    cluster_seqs[cluster_id] = []
+                cluster_seqs[cluster_id].append((seq_id, sequence))
+        
+        # Write cluster files
+        for cluster_id, seqs in cluster_seqs.items():
+            written += 1
+            fname = os.path.join(output_folder, f"cluster_{written}.fasta")
+            with open(fname, 'w') as f:
+                for seq_id, sequence in seqs:
+                    f.write(f">{seq_id}\n{sequence}\n")
+        
+        # Clean up batch file
+        os.remove(batch_fname)
+        
+        if (batch_idx + 1) % 10 == 0:
+            print(f"Processed {batch_idx+1}/{num_batch_files} batch files, written {written} clusters", flush=True)
+    
+    # Clean up temp directory
+    os.rmdir(temp_dir)
+    
+    print(f"\n✓ All cluster files written: {written:,}", flush=True)
+    
+    # Plot cluster size distribution
+    fig = plt.figure()
+    hist_clussize = []
+    for size in cluster_sizes:
+        hist_clussize.extend([size] * size)
+    
+    if hist_clussize:
+        med = np.median(hist_clussize)
+        plt.hist(hist_clussize, bins=np.arange(1, max(hist_clussize)+2, 1))
+        textstr = f"Median: {med}"
+        print(f"Median number of sequences per cluster: {med}")
+        plt.text(0.85, 0.85, textstr, transform=fig.transFigure, ha='right')
+        plt.xlabel("Cluster size")
+        plt.ylabel("Number of sequences")
+        plt.savefig(output_folder + "_clustersizes_sequences.pdf", bbox_inches='tight')
+        print("Clustersize distribution plotted")
+    
+    return True
+
+if __name__ == '__main__' and mode == 'clusterfull_fast':
+    #Setup
+    input_UMIfile = args.input
+    input_READSfile = args.reads
+    identity_thresh = args.identity
+    size_thresh = args.size_thresh
+    output_folder = args.output
+    
+    #Make output directory
+    if not os.path.exists(output_folder):
+        os.makedirs(output_folder)
+    
+    print(f"Using CD-HIT fast clustering...")
+    print(f"Using streaming approach for reads file: {input_READSfile}")
+    
+    # Run CD-HIT clustering
+    success = run_cdhit_clustering(input_UMIfile, output_folder, identity_thresh, size_thresh, input_READSfile)
+    
+    if success:
+        print("✓ Fast clustering completed successfully!")
+    else:
+        print("✗ Fast clustering failed!")
 
 
