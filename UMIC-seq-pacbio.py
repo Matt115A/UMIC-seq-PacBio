@@ -529,6 +529,16 @@ Examples:
     analyze_parser.add_argument('--reference', required=True, help='Reference FASTA file')
     analyze_parser.add_argument('--output', required=True, help='Output CSV file')
     
+    # NGS counting command
+    ngs_parser = subparsers.add_parser('ngs_count', help='Count pool reads per variant via UMI matching')
+    ngs_parser.add_argument('--pools_dir', required=True, help='Directory containing per-pool folders with R1/R2 fastqs')
+    ngs_parser.add_argument('--consensus_dir', required=True, help='Consensus directory (from consensus step)')
+    ngs_parser.add_argument('--variants_dir', required=True, help='Variants directory with per-consensus VCFs')
+    ngs_parser.add_argument('--probe', required=True, help='Probe FASTA file (same used for UMI extraction)')
+    ngs_parser.add_argument('--umi_len', type=int, default=52, help='UMI length (default: 52)')
+    ngs_parser.add_argument('--umi_loc', type=str, default='up', choices=['up','down'], help='UMI location relative to probe (default: up)')
+    ngs_parser.add_argument('--output', required=True, help='Output counts CSV file')
+    
     args = parser.parse_args()
     
     if not args.command:
@@ -559,6 +569,11 @@ Examples:
     else:
         print(f"❌ Unknown command: {args.command}")
         return 1
+    
+    if args.command == 'ngs_count':
+        from ngs_count import run_ngs_count
+        ok = run_ngs_count(args.pools_dir, args.consensus_dir, args.variants_dir, args.probe, args.umi_len, args.umi_loc, args.output)
+        return 0 if ok else 1
     
     return 0 if success else 1
 
