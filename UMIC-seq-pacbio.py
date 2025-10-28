@@ -566,14 +566,15 @@ Examples:
         success = run_variant_calling(args)
     elif args.command == 'analyze':
         success = run_analysis(args)
+    elif args.command == 'ngs_count':
+        print("=" * 60)
+        print("NGS POOL COUNTING")
+        print("=" * 60)
+        from ngs_count import run_ngs_count
+        success = run_ngs_count(args.pools_dir, args.consensus_dir, args.variants_dir, args.probe, args.umi_len, args.umi_loc, args.output)
     else:
         print(f"❌ Unknown command: {args.command}")
         return 1
-    
-    if args.command == 'ngs_count':
-        from ngs_count import run_ngs_count
-        ok = run_ngs_count(args.pools_dir, args.consensus_dir, args.variants_dir, args.probe, args.umi_len, args.umi_loc, args.output)
-        return 0 if ok else 1
     
     return 0 if success else 1
 

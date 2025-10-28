@@ -17,6 +17,11 @@ import sys
 import gzip
 from pathlib import Path
 from typing import Dict, List, Tuple, Iterable
+import traceback
+
+# Force immediate output - write directly to stderr if needed
+if hasattr(sys.stdout, 'reconfigure'):
+    sys.stdout.reconfigure(line_buffering=True)
 
 
 def open_maybe_gzip(path: str):
@@ -92,9 +97,11 @@ def extract_umi_from_read(seq: str, probe_fwd: str, probe_rev: str, umi_len: int
 
 def load_consensus_fasta(consensus_dir: str) -> Dict[str, str]:
     cons: Dict[str, str] = {}
-    for fn in os.listdir(consensus_dir):
-        if not fn.endswith('.fasta') and not fn.endswith('.fa'):
-            continue
+    files = [f for f in os.listdir(consensus_dir) if f.endswith('.fasta') or f.endswith('.fa')]
+    total = len(files)
+    for idx, fn in enumerate(files):
+        if idx % 1000 == 0 and idx > 0:
+            print(f"  Loaded {idx}/{total} consensus files...", flush=True)
         path = os.path.join(consensus_dir, fn)
         name = Path(fn).stem
         # read first record only
@@ -116,7 +123,10 @@ def build_umi_index(consensus_map: Dict[str, str], umi_len: int) -> Dict[str, st
     Index is built from circular sequences on both strands.
     """
     idx: Dict[str, str] = {}
-    for name, seq in consensus_map.items():
+    total = len(consensus_map)
+    for count, (name, seq) in enumerate(consensus_map.items()):
+        if count > 0 and count % 1000 == 0:
+            print(f"  Indexed {count}/{total} consensus sequences...", flush=True)
         if not seq:
             continue
         seq_circ = (seq + seq)
@@ -201,41 +211,75 @@ def find_r1_r2(folder: str) -> Tuple[str, str]:
 
 def run_ngs_count(pools_dir: str, consensus_dir: str, variants_dir: str, probe_fasta: str,
                   umi_len: int, umi_loc: str, output_csv: str) -> bool:
-    # Load probe
-    probe_fwd, probe_rev = load_probe_sequences(probe_fasta)
+    try:
+        print("Starting...", flush=True)
+        print("Loading probe sequences...", flush=True)
+        probe_fwd, probe_rev = load_probe_sequences(probe_fasta)
+        print(f"Probe length: {len(probe_fwd)} bp", flush=True)
 
-    # Load consensus and build UMI index
-    consensus = load_consensus_fasta(consensus_dir)
-    umi_index = build_umi_index(consensus, umi_len)
+        print("Loading consensus sequences...", flush=True)
+        consensus = load_consensus_fasta(consensus_dir)
+        print(f"Loaded {len(consensus)} consensus sequences", flush=True)
 
-    # Collect variant rows and per-consensus mapping
-    var_rows, per_consensus = collect_all_variant_rows(variants_dir)
+        print("Building UMI index (circular, both strands)...", flush=True)
+        umi_index = build_umi_index(consensus, umi_len)
+        print(f"Index contains {len(umi_index)} unique UMIs", flush=True)
 
-    # Prepare counts table: rows x pools
-    pool_folders = find_pool_folders(pools_dir)
-    pool_names = [Path(p).name for p in pool_folders]
+        print("Collecting variant rows...", flush=True)
+        var_rows, per_consensus = collect_all_variant_rows(variants_dir)
+        print(f"Found {len(var_rows)} unique variant rows across {len(per_consensus)} consensus", flush=True)
+
+        print(f"Finding pool folders in: {pools_dir}", flush=True)
+        pool_folders = find_pool_folders(pools_dir)
+        pool_names = [Path(p).name for p in pool_folders]
+        print(f"Found {len(pool_folders)} pools: {pool_names}", flush=True)
+    except Exception as e:
+        print(f"ERROR in initialization: {e}", flush=True)
+        traceback.print_exc()
+        return False
+
     counts = [[0 for _ in pool_folders] for _ in range(len(var_rows))]
 
     for j, pool in enumerate(pool_folders):
+        pool_name = pool_names[j]
+        print(f"\nProcessing pool {j+1}/{len(pool_folders)}: {pool_name}")
         r1, r2 = find_r1_r2(pool)
         if not r1 or not r2:
+            print(f"  WARNING: Missing R1 or R2 files, skipping")
             continue
+        print(f"  R1: {Path(r1).name}")
+        print(f"  R2: {Path(r2).name}")
+        
+        read_count = 0
+        umi_extracted = 0
+        umi_matched = 0
+        
         # Stream paired reads in lockstep
         for s1, s2 in zip(read_fastq_sequences(r1), read_fastq_sequences(r2)):
+            read_count += 1
+            if read_count % 100000 == 0:
+                print(f"  Processed {read_count:,} reads, extracted {umi_extracted}, matched {umi_matched}", end='\r')
+            
             # Prefer R1 for UMI extraction; fallback to R2
             umi = extract_umi_from_read(s1, probe_fwd, probe_rev, umi_len, umi_loc)
             if not umi:
                 umi = extract_umi_from_read(s2, probe_fwd, probe_rev, umi_len, umi_loc)
             if not umi:
                 continue
+            umi_extracted += 1
+            
             cons_name = umi_index.get(umi)
             if not cons_name:
                 continue
+            umi_matched += 1
+            
             idxs = per_consensus.get(cons_name, [])
             for i in idxs:
                 counts[i][j] += 1
+        
+        print(f"\n  Pool {pool_name}: {read_count:,} reads, {umi_extracted} UMIs extracted, {umi_matched} matched to consensus")
 
-    # Write CSV
+    print(f"\nWriting output to: {output_csv}")
     with open(output_csv, 'w') as out:
         header = ['CHROM', 'POS', 'REF', 'ALT'] + pool_names
         out.write(','.join(header) + '\n')
@@ -243,7 +287,8 @@ def run_ngs_count(pools_dir: str, consensus_dir: str, variants_dir: str, probe_f
             chrom, pos, ref, alt = key
             row = [str(chrom), str(pos), ref, alt] + [str(counts[i][j]) for j in range(len(pool_folders))]
             out.write(','.join(row) + '\n')
-
+    
+    print("Done!")
     return True
 
 
