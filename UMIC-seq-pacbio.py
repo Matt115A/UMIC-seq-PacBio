@@ -549,6 +549,15 @@ Examples:
     ngs_parser.add_argument('--left_ignore', type=int, default=22, help='Bases to ignore from start of assembled read (default: 22)')
     ngs_parser.add_argument('--right_ignore', type=int, default=24, help='Bases to ignore from end of assembled read (default: 24)')
     
+    # Fitness analysis command
+    fitness_parser = subparsers.add_parser('fitness', help='Analyze fitness from merged non-synonymous counts')
+    fitness_parser.add_argument('--input', required=True, help='Input CSV file (merged_on_nonsyn_counts.csv)')
+    fitness_parser.add_argument('--output_dir', required=True, help='Output directory for plots and results')
+    fitness_parser.add_argument('--input_pools', required=True, nargs='+', help='Input pool names (space-separated)')
+    fitness_parser.add_argument('--output_pools', required=True, nargs='+', help='Output pool names (space-separated, paired with inputs)')
+    fitness_parser.add_argument('--min_input', type=int, default=10, help='Minimum count threshold in input pools (default: 10)')
+    fitness_parser.add_argument('--aa_filter', type=str, default=None, help='Filter mutability plot to specific mutant amino acid (e.g., S for serine, P for proline, * for stop codons)')
+    
     args = parser.parse_args()
     
     if not args.command:
@@ -592,6 +601,19 @@ Examples:
             args.reference,
             args.left_ignore,
             args.right_ignore
+        )
+    elif args.command == 'fitness':
+        print("=" * 60)
+        print("FITNESS ANALYSIS")
+        print("=" * 60)
+        from fitness_analysis import run_fitness_analysis
+        success = run_fitness_analysis(
+            args.input,
+            args.output_dir,
+            args.input_pools,
+            args.output_pools,
+            args.min_input,
+            args.aa_filter
         )
     else:
         print(f"Unknown command: {args.command}")

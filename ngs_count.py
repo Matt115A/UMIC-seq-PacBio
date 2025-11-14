@@ -326,15 +326,64 @@ def find_pool_folders(pools_dir: str) -> List[str]:
     return folders
 
 
-def find_r1_r2(folder: str) -> Tuple[str, str]:
-    r1 = r2 = ''
+def find_r1_r2_pairs(folder: str) -> List[Tuple[str, str]]:
+    """Find all R1/R2 pairs in a folder. Pairs are identified by matching basenames
+    that differ only by R1/R2 designation.
+    Returns list of (r1_path, r2_path) tuples.
+    """
+    r1_files = {}
+    r2_files = {}
+    
     for fn in os.listdir(folder):
-        if fn.endswith('.fastq') or fn.endswith('.fastq.gz'):
-            if '_R1' in fn or 'R1.' in fn:
-                r1 = os.path.join(folder, fn)
-            elif '_R2' in fn or 'R2.' in fn:
-                r2 = os.path.join(folder, fn)
-    return r1, r2
+        if not (fn.endswith('.fastq') or fn.endswith('.fastq.gz')):
+            continue
+        
+        full_path = os.path.join(folder, fn)
+        
+        # Normalize filename to extract base key (remove R1/R2 and extension)
+        # Handle patterns: sample_R1.fastq.gz, sample_R1_001.fastq.gz, sampleR1.fastq.gz
+        key = None
+        
+        if '_R1' in fn:
+            # Replace _R1 with placeholder, then remove extension
+            key = fn.replace('_R1', '_R*')
+            # Remove extension
+            if key.endswith('.fastq.gz'):
+                key = key[:-9]  # Remove .fastq.gz
+            elif key.endswith('.fastq'):
+                key = key[:-6]  # Remove .fastq
+            r1_files[key] = full_path
+        elif 'R1.' in fn:
+            # Handle R1.fastq.gz pattern
+            key = fn.replace('R1.', 'R*.')
+            if key.endswith('.fastq.gz'):
+                key = key[:-9]
+            elif key.endswith('.fastq'):
+                key = key[:-6]
+            r1_files[key] = full_path
+        
+        if '_R2' in fn:
+            key = fn.replace('_R2', '_R*')
+            if key.endswith('.fastq.gz'):
+                key = key[:-9]
+            elif key.endswith('.fastq'):
+                key = key[:-6]
+            r2_files[key] = full_path
+        elif 'R2.' in fn:
+            key = fn.replace('R2.', 'R*.')
+            if key.endswith('.fastq.gz'):
+                key = key[:-9]
+            elif key.endswith('.fastq'):
+                key = key[:-6]
+            r2_files[key] = full_path
+    
+    # Match pairs by key
+    pairs = []
+    for key in r1_files:
+        if key in r2_files:
+            pairs.append((r1_files[key], r2_files[key]))
+    
+    return pairs
 
 
 def run_ngs_count(pools_dir: str, consensus_dir: str, variants_dir: str, probe_fasta: str,
@@ -380,85 +429,112 @@ def run_ngs_count(pools_dir: str, consensus_dir: str, variants_dir: str, probe_f
     for j, pool in enumerate(pool_folders):
         pool_name = pool_names[j]
         print(f"\nProcessing pool {j+1}/{len(pool_folders)}: {pool_name}")
-        r1, r2 = find_r1_r2(pool)
-        if not r1 or not r2:
-            print(f"  WARNING: Missing R1 or R2 files, skipping")
+        
+        # Find all R1/R2 pairs in this pool
+        pairs = find_r1_r2_pairs(pool)
+        if not pairs:
+            print(f"  WARNING: No R1/R2 pairs found, skipping")
             continue
-        print(f"  R1: {Path(r1).name}")
-        print(f"  R2: {Path(r2).name}")
         
-        # Prefer PEAR merging for robust overlap handling
-        assembled_fastq = os.path.join(pool, f"{pool_name}_assembled.fastq")
-        try:
-            print("  Merging with PEAR...", flush=True)
-            # PEAR outputs: .assembled.fastq, .unassembled.forward.fastq, .unassembled.reverse.fastq
-            # We'll write to pool folder with prefix pool_name
-            prefix = os.path.join(pool, pool_name)
-            cmd = [
-                'pear',
-                '-f', r1,
-                '-r', r2,
-                '-o', prefix,
-                '-q', '20',
-                '-t', '100'
-            ]
-            subprocess.run(cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        print(f"  Found {len(pairs)} R1/R2 pair(s)")
+        
+        # Accumulate counts across all pairs in this pool
+        pool_read_count = 0
+        pool_umi_extracted = 0
+        pool_umi_matched = 0
+        
+        for pair_idx, (r1, r2) in enumerate(pairs):
+            pair_name = Path(r1).stem.replace('_R1', '').replace('R1', '')
+            if len(pairs) > 1:
+                print(f"  Processing pair {pair_idx+1}/{len(pairs)}: {Path(r1).name} / {Path(r2).name}")
+            else:
+                print(f"  R1: {Path(r1).name}")
+                print(f"  R2: {Path(r2).name}")
+            
+            # Prefer PEAR merging for robust overlap handling
+            # Use unique prefix for each pair to avoid conflicts
+            prefix = os.path.join(pool, f"{pool_name}_pair{pair_idx+1}")
             assembled_fastq = prefix + '.assembled.fastq'
-            if not os.path.exists(assembled_fastq):
-                print("  WARNING: PEAR did not produce assembled reads; falling back to on-the-fly merge")
-                assembled_fastq = ''
-        except Exception as e:
-            print(f"  WARNING: PEAR merge failed ({e}); falling back to on-the-fly merge")
-            assembled_fastq = ''
+            
+            # Check if PEAR output already exists
+            if os.path.exists(assembled_fastq):
+                print("    Using existing PEAR output...", flush=True)
+            else:
+                # Run PEAR if output doesn't exist
+                try:
+                    print("    Merging with PEAR...", flush=True)
+                    cmd = [
+                        'pear',
+                        '-f', r1,
+                        '-r', r2,
+                        '-o', prefix,
+                        '-q', '20',
+                        '-t', '100'
+                    ]
+                    subprocess.run(cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+                    if not os.path.exists(assembled_fastq):
+                        print("    WARNING: PEAR did not produce assembled reads; falling back to on-the-fly merge")
+                        assembled_fastq = ''
+                except Exception as e:
+                    print(f"    WARNING: PEAR merge failed ({e}); falling back to on-the-fly merge")
+                    assembled_fastq = ''
 
-        read_count = 0
-        umi_extracted = 0
-        umi_matched = 0
+            read_count = 0
+            umi_extracted = 0
+            umi_matched = 0
 
-        if assembled_fastq:
-            print("  Scanning assembled reads for UMI/probe matches...", flush=True)
-            for seq in read_fastq_sequences(assembled_fastq):
-                read_count += 1
-                if read_count % 100000 == 0:
-                    print(f"  Processed {read_count:,} merged reads, extracted {umi_extracted}, matched {umi_matched}", end='\r')
-                umi = extract_umi_from_assembled(seq, umi_len, left_ignore, right_ignore)
-                if not umi:
-                    continue
-                umi_extracted += 1
-                cons_name = umi_index.get(umi)
-                if not cons_name:
-                    continue
-                umi_matched += 1
-                idxs = per_consensus.get(cons_name, [])
-                for i in idxs:
-                    counts[i][j] += 1
-                if cons_name in hap_index:
-                    hap_counts[hap_index[cons_name]][j] += 1
-        else:
-            # Fallback: stream paired reads and merge on the fly
-            for s1, s2 in zip(read_fastq_sequences(r1), read_fastq_sequences(r2)):
-                read_count += 1
-                if read_count % 100000 == 0:
-                    print(f"  Processed {read_count:,} reads, extracted {umi_extracted}, matched {umi_matched}", end='\r')
-                # Merge, trim and extract from merged
-                merged = merge_trimmed_internal(s1, s2, left_ignore, right_ignore)
-                if not merged:
-                    continue
-                umi = extract_umi_from_assembled(merged, umi_len, left_ignore, right_ignore)
-                if not umi:
-                    continue
-                umi_extracted += 1
-                cons_name = umi_index.get(umi)
-                if not cons_name:
-                    continue
-                umi_matched += 1
-                idxs = per_consensus.get(cons_name, [])
-                for i in idxs:
-                    counts[i][j] += 1
-                if cons_name in hap_index:
-                    hap_counts[hap_index[cons_name]][j] += 1
-        
-        print(f"\n  Pool {pool_name}: {read_count:,} reads, {umi_extracted} UMIs extracted, {umi_matched} matched to consensus")
+            if assembled_fastq:
+                print("    Scanning assembled reads for UMI matches...", flush=True)
+                for seq in read_fastq_sequences(assembled_fastq):
+                    read_count += 1
+                    if read_count % 100000 == 0:
+                        print(f"    Processed {read_count:,} merged reads, extracted {umi_extracted}, matched {umi_matched}", end='\r')
+                    umi = extract_umi_from_assembled(seq, umi_len, left_ignore, right_ignore)
+                    if not umi:
+                        continue
+                    umi_extracted += 1
+                    cons_name = umi_index.get(umi)
+                    if not cons_name:
+                        continue
+                    umi_matched += 1
+                    idxs = per_consensus.get(cons_name, [])
+                    for i in idxs:
+                        counts[i][j] += 1
+                    if cons_name in hap_index:
+                        hap_counts[hap_index[cons_name]][j] += 1
+            else:
+                # Fallback: stream paired reads and merge on the fly
+                print("    Merging reads on-the-fly...", flush=True)
+                for s1, s2 in zip(read_fastq_sequences(r1), read_fastq_sequences(r2)):
+                    read_count += 1
+                    if read_count % 100000 == 0:
+                        print(f"    Processed {read_count:,} reads, extracted {umi_extracted}, matched {umi_matched}", end='\r')
+                    # Merge, trim and extract from merged
+                    merged = merge_trimmed_internal(s1, s2, left_ignore, right_ignore)
+                    if not merged:
+                        continue
+                    umi = extract_umi_from_assembled(merged, umi_len, left_ignore, right_ignore)
+                    if not umi:
+                        continue
+                    umi_extracted += 1
+                    cons_name = umi_index.get(umi)
+                    if not cons_name:
+                        continue
+                    umi_matched += 1
+                    idxs = per_consensus.get(cons_name, [])
+                    for i in idxs:
+                        counts[i][j] += 1
+                    if cons_name in hap_index:
+                        hap_counts[hap_index[cons_name]][j] += 1
+            
+            pool_read_count += read_count
+            pool_umi_extracted += umi_extracted
+            pool_umi_matched += umi_matched
+            
+            if len(pairs) > 1:
+                print(f"\n    Pair {pair_idx+1} summary: {read_count:,} reads, {umi_extracted:,} UMIs extracted, {umi_matched:,} matched")
+
+        print(f"\n  Pool {pool_name} total: {pool_read_count:,} reads, {pool_umi_extracted:,} UMIs extracted, {pool_umi_matched:,} matched to consensus")
 
     print(f"\nWriting output to: {output_csv}")
     with open(output_csv, 'w') as out:

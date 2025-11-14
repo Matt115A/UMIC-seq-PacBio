@@ -160,7 +160,77 @@ Outputs:
 Notes:
 - For Illumina reads, UMIs are taken from the internal region of merged reads (default first 22 and last 24 bases ignored); the probe is not searched in Illumina.
 - Amino acid numbering is 1-indexed; multiple nucleotide changes within a codon are combined into a single AA mutation.
+
+### Fitness Analysis
+
+The fitness analysis module processes `merged_on_nonsyn_counts.csv` to calculate fitness from input/output pool comparisons and generate comprehensive visualizations.
+
+**Key Features:**
+- Filters variants by minimum input count threshold
+- Calculates relative frequencies (column normalization)
+- Computes log fitness ratios: `log(rel_output / rel_input)` for each input/output pair
+- Calculates average fitness across all pairs
+- Bootstrap confidence intervals for fitness estimates (when multiple replicates available)
+- Generates mutability, epistasis, fitness distribution, reproducibility, and substitution matrix plots
+
+**Requirements:**
+- pandas, numpy, matplotlib, seaborn (typically available via conda/pip)
+
+**Usage:**
+```bash
+python UMIC-seq-pacbio.py fitness \
+  --input merged_on_nonsyn_counts.csv \
+  --output_dir fitness_results/ \
+  --input_pools pool1 pool2 \
+  --output_pools pool3 pool4 \
+  --min_input 10 \
+  --aa_filter S
 ```
+
+**Arguments:**
+- `--input`: Path to `merged_on_nonsyn_counts.csv` (from ngs_count step)
+- `--output_dir`: Directory to save plots and processed data
+- `--input_pools`: Space-separated list of input pool names (e.g., `pool1 pool2`)
+- `--output_pools`: Space-separated list of output pool names, paired with inputs (e.g., `pool3 pool4`)
+- `--min_input` (default: 10): Minimum count threshold in input pools; variants below this in any input are filtered out
+- `--aa_filter` (optional): Filter mutability plot to specific mutant amino acid (e.g., `S` for serine, `P` for proline, `*` for stop codons)
+
+**Outputs:**
+- `fitness_analysis_results.csv`: Processed data with fitness calculations, relative frequencies, mutation annotations, and bootstrap confidence intervals (if multiple replicates)
+- `mutability_plot.png`: Average fitness at each position for Hamming 1 (single) mutants, relative to WT
+- `mutability_plot_{AA}.png`: Mutability plot filtered to specific amino acid (if `--aa_filter` used)
+- `epistasis_plot.png`: Scatter plot of sum of single mutant fitnesses (x-axis) vs double mutant fitness (y-axis)
+  - Only includes double mutants where both constituent singles are present in the dataset
+  - Includes additivity line and correlation coefficient
+- `fitness_distributions.png`: Overlaid KDE plots for single mutants:
+  - Stop codons
+  - Proline mutations
+  - All other mutations
+- `hamming_distributions.png`: Overlaid KDE plots for fitness distributions at Hamming distances 1-5
+- `reproducibility_plot.png`: Pairwise comparison heatmaps of fitness across replicate pairs (only generated if ≥2 replicates)
+  - Shows correlation between replicates with density heatmaps (blue→red color scheme)
+- `substitution_matrix.png`: Heatmap showing average fitness for each amino acid substitution type (21×21 matrix including stop codons)
+  - Amino acids arranged by similarity (hydrophobic, polar, charged, etc.)
+  - Red = beneficial, Blue = deleterious
+- `substitution_matrix.csv`: Full substitution matrix data for further analysis
+
+**Example with multiple input/output pairs:**
+```bash
+python UMIC-seq-pacbio.py fitness \
+  --input merged_on_nonsyn_counts.csv \
+  --output_dir fitness_results/ \
+  --input_pools input_pool1 input_pool2 \
+  --output_pools output_pool1 output_pool2 \
+  --min_input 15
+```
+
+**Notes:**
+- Fitness is calculated as `log(rel_output / rel_input)` where relative frequencies are column-normalized
+- Average fitness is the mean across all input/output pairs
+- Bootstrap confidence intervals (95% CI) are calculated using replicate-level resampling (1000 iterations) when multiple replicates are available
+- Epistasis analysis requires both single and double mutants to be present in the dataset
+- Mutability plots show average fitness aggregated across all single mutants at each position, relative to WT
+- Reproducibility plot requires at least 2 replicate pairs
 
 ### Threshold Selection Guide
 
@@ -184,6 +254,14 @@ The pipeline generates:
   - Columns: `CONSENSUS`, `MUTATIONS` (nucleotide, position-sorted), `AA_MUTATIONS` (non-synonymous only, grouped by codon)
   - Example AA format: `S45F+Y76P`; wild type is `WT`
 - `merged_on_nonsyn_counts.csv`: haplotype counts merged by identical non-synonymous amino acid patterns; includes the contributing consensus IDs, distinct nucleotide mutation strings, and per-pool totals
+- `fitness_analysis_results.csv`: Processed fitness data with log ratios, annotations, and bootstrap CIs (from fitness analysis step)
+- `mutability_plot.png`: Average fitness by position for single mutants (from fitness analysis step)
+- `epistasis_plot.png`: Epistasis analysis plot (from fitness analysis step)
+- `fitness_distributions.png`: Fitness distributions by mutation type (from fitness analysis step)
+- `hamming_distributions.png`: Fitness distributions by Hamming distance (from fitness analysis step)
+- `reproducibility_plot.png`: Replicate comparison heatmaps (from fitness analysis step, if ≥2 replicates)
+- `substitution_matrix.png`: Amino acid substitution fitness heatmap (from fitness analysis step)
+- `substitution_matrix.csv`: Substitution matrix data (from fitness analysis step)
 
 Note that this pipeline has been used for both PacBio and ONT data.
 
