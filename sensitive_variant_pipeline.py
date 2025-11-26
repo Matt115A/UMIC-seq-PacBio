@@ -24,7 +24,9 @@ def extract_variants_from_sam(sam_file, reference_file, output_vcf):
         ref_seq = ''.join(ref_lines)
     
     # Read SAM alignment
-    variants = []
+    # Use dictionary to deduplicate variants by position (chr:pos:ref:alt)
+    # This ensures only one variant per position is kept
+    variants_dict = {}
     
     with open(sam_file, 'r') as f:
         for line in f:
@@ -34,9 +36,22 @@ def extract_variants_from_sam(sam_file, reference_file, output_vcf):
             parts = line.strip().split('\t')
             if len(parts) < 11:
                 continue
+            
+            # Check SAM flag - skip secondary alignments (flag 0x100 = 256)
+            # Only process primary alignments
+            try:
+                flag = int(parts[1])
+                if flag & 0x100:  # Secondary alignment flag
+                    continue
+            except (ValueError, IndexError):
+                continue
                 
             cigar = parts[5]
             seq = parts[9]
+            
+            # Skip if CIGAR is * (unmapped)
+            if cigar == '*':
+                continue
             
             # Parse CIGAR string to find mismatches
             pos = int(parts[3]) - 1  # Convert to 0-based
@@ -54,13 +69,17 @@ def extract_variants_from_sam(sam_file, reference_file, output_vcf):
                         if ref_pos < len(ref_seq) and seq_pos < len(seq):
                             if ref_seq[ref_pos] != seq[seq_pos]:
                                 # Found a mismatch!
-                                variants.append({
-                                    'chr': parts[2],
-                                    'pos': ref_pos + 1,  # Convert back to 1-based
-                                    'ref': ref_seq[ref_pos],
-                                    'alt': seq[seq_pos],
-                                    'qual': 30  # Default quality
-                                })
+                                # Use position as key to deduplicate
+                                # If same position has different ALT, keep the first one encountered
+                                var_key = (parts[2], ref_pos + 1)  # chr, pos (1-based)
+                                if var_key not in variants_dict:
+                                    variants_dict[var_key] = {
+                                        'chr': parts[2],
+                                        'pos': ref_pos + 1,  # Convert back to 1-based
+                                        'ref': ref_seq[ref_pos],
+                                        'alt': seq[seq_pos],
+                                        'qual': 30  # Default quality
+                                    }
                             ref_pos += 1
                             seq_pos += 1
                 
@@ -75,6 +94,9 @@ def extract_variants_from_sam(sam_file, reference_file, output_vcf):
                 elif op == 'S':  # Soft clip
                     # Skip read positions
                     seq_pos += length
+    
+    # Convert dictionary to sorted list
+    variants = sorted(variants_dict.values(), key=lambda x: (x['chr'], x['pos']))
     
     # Write VCF
     with open(output_vcf, 'w') as f:
